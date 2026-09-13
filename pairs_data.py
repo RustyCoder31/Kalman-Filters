@@ -30,6 +30,10 @@ Q = loaded_params['Q']
 
 betas = []
 visa_predicted = []
+residuals = []
+residuals_zscore = []
+system_vars = []
+residuals_zscore = []
 
 # 6. Apply the Kalman filter to the Visa and MasterCard data
 
@@ -43,9 +47,16 @@ for i in range(len(visa)):
 
     P = P + Q
     residual = V - beta * H
-    KG = (P * H) / (P * H * H + R)
+    system_var = P * H * H + R
+    KG = (P * H) / (system_var)
     beta = beta + KG * residual
     P = (1 - KG * H) * P
+
+    residuals.append(residual)
+    system_vars.append(system_var)
+    residuals_zscore.append(residual / (system_var ** 0.5))
+
+
 
 # 7. Plotting the actual Visa prices, the Kalman filter predicted Visa prices, and the beta coefficient over time
 

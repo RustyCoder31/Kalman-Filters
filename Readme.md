@@ -74,4 +74,70 @@ A naive OLS regression over the whole period gives one fixed beta: a flat line. 
 
 The orange dashed line is the Kalman filter's prediction (`V = beta * H`), the blue line is Visa's actual price. Because beta updates over time instead of staying fixed, the prediction tracks Visa's actual price closely across the full ~1.5-year window, without the permanent drift a fixed-beta model would show once the true relationship shifts.
 
-There are still visible gaps where the actual price pulls away from the prediction for a stretch (e.g. around 2026-05) before the two lines converge again; that's the residual the filter is reacting to. I haven't tested yet whether these gaps are statistically mean-reverting; that's exactly what Phase 2 (cointegration/stationarity testing) is for, next. Right now this shows the filter can track a shifting hedge ratio; it isn't yet evidence of a tradeable arbitrage signal, and no trading logic is built on top of it yet.
+There are still visible gaps where the actual price pulls away from the prediction for a stretch (e.g. around 2026-05) before the two lines converge again; that's the residual the filter is reacting to. Whether those gaps are statistically mean-reverting is exactly what Phase 2, below, tests.
+
+**3. Naive fixed beta vs. Kalman (`Naive vs Kalman.png`)**
+
+To show the dynamic beta actually earns its keep, `naive_vs_kalman.py` holds the calibrated beta constant for the entire out-of-sample window (no updating, the naive approach) and plots it against the same Kalman prediction and the actual price. For most of the window the naive line tracks reasonably well, since beta only drifts slowly. But around 2026-07 to 2026-08, when beta climbs sharply toward its peak (see chart 1 above), the naive fixed-beta line falls well below the actual price and stays there, while the Kalman prediction keeps pace. That's the concrete cost of a fixed beta: it can't follow a real shift in the relationship, it just gets increasingly wrong until someone recalibrates it by hand.
+
+## Phase 2: Is the spread actually mean-reverting? (Cointegration testing)
+
+### Problem statement
+
+Phase 1 shows the filter can track a shifting beta, but that's not proof the gap between predicted and actual price (the residual) is anything more than a coincidence over this one window. On their own, Visa and Mastercard are just two random walks: nothing forces either of them back to a value, they could drift apart forever and nobody would be surprised. The real question is about the *residual*: does it act like a rubber band pulling back to zero, or is it secretly just as random as the two prices it's built from?
+
+### My theory
+
+Picture the residual as a rubber band tied to zero. Every day it either stretches away or gets pulled back in. "Does the current position affect the next move" is exactly what the ADF test answers:
+
+```
+Δy_t = α + γ·y_{t-1} + ε_t
+```
+
+`γ` is the physical pull of the leash. Say `y_{t-1}` (yesterday's z-scored residual) was +2, and `γ = -1`: today's move is `γ·y_{t-1} = -1 × 2 = -2`, price moved +2 yesterday, so today it snaps back by -2. `ε_t` is just the noise of that particular day: if the rubber band "should" have snapped back by $1 (per `γ`) but it actually snapped back by $1.2, that extra $0.2 is `ε_t`.
+
+- `γ → 0`: no pull at all, random walk.
+- `γ < 0`: there's a real pull back to the mean, stationary.
+- `y_{t-1}` high → `Δy` comes back negative. `y_{t-1}` low → `Δy` comes back positive. Either way, pulled toward 0.
+
+ADF has one limitation though: it only tests a single line of data, and I have two (Visa and Mastercard). That's the Engle-Granger problem, a formal two-step method to bridge the gap between two random walks and a single ADF test: (1) residual = Visa - β·Mastercard, (2) run ADF on that residual. Visa and Mastercard individually can't be predicted and don't have to return to any value; the residual does, if the pair is genuinely cointegrated.
+
+How much I trust `γ` comes down to `γ/SE(γ)`, checked against critical values that work like finish lines for how strict I want to be before I trust the bet:
+
+- 10% critical value (-2.57) → 90% sure this is a real rubber band, not random.
+- 5% critical value (-2.86) → 95% sure.
+- 1% critical value (-3.44) → 99% sure.
+
+`SE(γ)` goes up when the daily noise (`ε_t`) is large: I'm partly blind to how strong the pull actually is. It goes down when `y_{t-1}` was stretched far (large variance in the lagged value): the snap-back is so obvious it cuts right through the noise. So beating the critical values needs a small SE: a strong pull, low daily noise, ideally both.
+
+Before trusting any of this on the real pair, I validated the test itself on synthetic data: ADF correctly called a fake random walk non-stationary (p=0.657) and correctly called a fake mean-reverting series stationary (p=1.2e-16).
+
+### Result
+
+Running this on the real V/MA Kalman residual (z-scored) over the full out-of-sample window (2025-03-04 to 2026-08-31):
+
+- **ADF statistic:** -3.89
+- **p-value:** 0.0021
+- **1% critical value:** -3.45
+
+-3.89 clears even the 1% line, so I'm more than 99% sure this isn't a random walk. The rubber band is real: **the V/MA spread is stationary, the pair is cointegrated.** Visa and Mastercard aren't just two random walks that happened to look similar over this stretch; the gap between them genuinely gets pulled back.
+
+### Half-life of mean reversion
+
+Once I knew the pull was real, I wanted to know how fast it snaps back, that's just reading `γ` directly:
+
+```
+half-life = -ln(2) / γ
+```
+
+`γ` came out to -0.078, right in the -0.05 to -0.2 range I'd expect for a half-life somewhere in the realistic 3 to 15 day zone. Plugged in: **half-life ≈ 8.9 trading days.** So when the spread stretches away from 0, about half that stretch tends to close within two weeks, that's the number any future trading logic needs to respect (a mean-reversion trade shouldn't need to be held for months to pay off; most of the pull happens in the first week or two).
+
+Implemented in `cointegration.py`, which imports the residual series computed by `pairs_data.py` rather than recomputing it. The script also plots the actual rubber-band relationship: yesterday's z-scored position on the x-axis, today's move on the y-axis, with the fitted `γ` line running through it. The negative slope *is* the pull, visually.
+
+### Robustness check
+
+The result above calibrates beta/R/Q out-of-sample (fit on 2025-01-01 to 2025-03-03 in `beta.py`, tested on 2025-03-04 onward, no look-ahead). As a check, I also recalibrated beta/R/Q with static and rolling OLS directly on the same window being tested (in-sample) and reran the whole thing: ADF -3.68, p=0.0043, still clears the 1% line. Same conclusion either way, though this second version is really just a same-window sanity check, not independent confirmation the way the first one is, since it's calibrated on the exact data it's then tested on.
+
+### Where this leaves things
+
+The rubber band is confirmed real, and I know roughly how fast it pulls back, that's a validated signal, not a trading strategy yet. No entry/exit rules, position sizing, or backtest built on top of this.
